@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"os/signal"
 	"strings"
 	"time"
 
@@ -32,12 +33,6 @@ const TIMEOUT = 5 * time.Second
 // MAXRECVSIZE is 12 + 4096 + 2 bytes
 const MAXRECVSIZE = 4110
 
-type rconPacket struct {
-	requestID  int32
-	packetType int32
-	payload    string
-}
-
 // prints to stderr and exits
 func ferrorln(a ...interface{}) {
 	fmt.Fprintln(os.Stderr, a...)
@@ -49,7 +44,7 @@ func errorln(a ...interface{}) {
 	fmt.Fprintln(os.Stderr, a...)
 }
 
-func colorPrint(text string) {
+func colorPrint(text string, colored bool) {
 	colorMap := map[byte]color.Attribute{
 		'0': color.FgBlack,
 		'1': color.FgBlue,
@@ -84,7 +79,9 @@ func colorPrint(text string) {
 			fmt.Print(part)
 			continue
 		}
-		color.Set(colorMap[part[0]])
+		if colored {
+			color.Set(colorMap[part[0]])
+		}
 		fmt.Print(part[1:])
 		color.Unset()
 	}
@@ -92,20 +89,25 @@ func colorPrint(text string) {
 	fmt.Println()
 }
 
-func serializePacket(data *rconPacket) []byte {
+type rconPacket struct {
+	requestID  int32
+	packetType int32
+	payload    string
+}
+
+func (rp *rconPacket) serialize() []byte {
 
 	// we keep the first 4 bytes for the packet size
 	packet := bytes.NewBuffer([]byte{})
 
 	// size = requestID + packetType + payload + padding
-	packetSize := int32(4 + 4 + len(data.payload) + 2)
+	packetSize := int32(4 + 4 + len(rp.payload) + 2)
 
 	// integers are little endian, opposite of Minecraft protocol
 	binary.Write(packet, binary.LittleEndian, packetSize)
-	binary.Write(packet, binary.LittleEndian, data.requestID)
-	binary.Write(packet, binary.LittleEndian, data.packetType)
-
-	binary.Write(packet, binary.LittleEndian, []byte(data.payload))
+	binary.Write(packet, binary.LittleEndian, rp.requestID)
+	binary.Write(packet, binary.LittleEndian, rp.packetType)
+	binary.Write(packet, binary.LittleEndian, []byte(rp.payload))
 
 	// two bytes of padding at the end
 	packet.Write([]byte{0, 0})
@@ -133,7 +135,7 @@ func makeLoginPacket(password string, requestID int32) []byte {
 		packetType: LOGINTYPE,
 		payload:    password,
 	}
-	return serializePacket(&packet)
+	return packet.serialize()
 }
 
 func makeCommandPacket(command string, requestID int32) []byte {
@@ -142,7 +144,7 @@ func makeCommandPacket(command string, requestID int32) []byte {
 		packetType: COMMANDTYPE,
 		payload:    command,
 	}
-	return serializePacket(&packet)
+	return packet.serialize()
 }
 
 func sendPacket(packet []byte, conn *net.TCPConn) error {
@@ -210,46 +212,68 @@ func login(password string, requestID int32, conn *net.TCPConn) error {
 	parsedResponse := parsePacket(response)
 	// fmt.Println("Parsed:\n", parsedResponse)
 
-	// parsedResponse.requestID would be -1 if password is wrong
 	if parsedResponse.requestID == requestID && parsedResponse.packetType == COMMANDTYPE {
 		return nil
+	} else if parsedResponse.requestID == -1 {
+		return fmt.Errorf("Password is incorrect")
 	}
 
+	// shouldn't get here
 	return fmt.Errorf("Login failed")
 }
 
-func interactiveMode(requestID int32, conn *net.TCPConn, colorOutput bool) error {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Print("> ")
-		input, err := reader.ReadString('\n')
-		// this also handles ctrl+c which is nice, the error is io.EOF
-		if err != nil {
-			return err
-		}
+// return nil to quit program
+func interactiveMode(requestID int32, conn *net.TCPConn, colored bool) error {
+	errchan := make(chan error, 1)
 
-		commandPacket := makeCommandPacket(strings.TrimSpace(input), requestID)
-		err = sendPacket(commandPacket, conn)
-		if err != nil {
-			return err
-		}
+	// handle ctrl+c and other kill methods
+	sigchan := make(chan os.Signal, 1)
+	signal.Notify(sigchan, os.Interrupt, os.Kill)
+	go func() {
+		<-sigchan
+		errchan <- nil
+		return
+	}()
 
-		responsePacket, err := receivePacket(conn)
-		if len(responsePacket) == 0 {
-			return fmt.Errorf("No response received")
-		}
-		response := parsePacket(responsePacket)
-		if colorOutput {
-			colorPrint(response.payload)
+	go func() {
+		reader := bufio.NewReader(os.Stdin)
+		for {
+			fmt.Print("> ")
+			input, err := reader.ReadString('\n')
+			// handle ctrl+d
+			if err == io.EOF {
+				fmt.Print("^D")
+				errchan <- nil
+				return
+			}
+			if err != nil {
+				errchan <- err
+				return
+			}
+
+			commandPacket := makeCommandPacket(strings.TrimSpace(input), requestID)
+			err = sendPacket(commandPacket, conn)
+			if err != nil {
+				errchan <- err
+				return
+			}
+
+			responsePacket, err := receivePacket(conn)
+			if len(responsePacket) == 0 {
+				errchan <- fmt.Errorf("No response received")
+				return
+			}
+			response := parsePacket(responsePacket)
+			colorPrint(response.payload, colored)
 			color.Unset()
-		} else {
-			fmt.Println(response.payload)
 		}
-	}
+	}()
+
+	return <-errchan
 }
 
 func printHelp() {
-	fmt.Println("Usage: mc_rcon [-p PORT] [-c] HOST")
+	fmt.Println("Usage: mc_rcon [OPTIONS...] HOST")
 	flag.PrintDefaults()
 }
 
@@ -257,10 +281,10 @@ func main() {
 	var host string
 	var port string
 	var password string
-	var colorOutput bool
+	var noColor bool
 
-	flag.StringVar(&port, "-port", "25575", "port number")
-	flag.BoolVar(&colorOutput, "-color", true, "enable color output")
+	flag.StringVar(&port, "port", "25575", "port number")
+	flag.BoolVar(&noColor, "no-color", false, "disable color output")
 
 	flag.Parse()
 
@@ -292,14 +316,16 @@ func main() {
 	}
 	fmt.Println("Successfully logged in")
 
-	err = interactiveMode(requestID, connection, colorOutput)
+	err = interactiveMode(requestID, connection, !noColor)
 	if err != nil {
 		errorln(err)
+	} else {
+		fmt.Println("\nShutting down...")
 	}
 
 	err = connection.Close()
 	if err != nil {
 		errorln(err)
 	}
-	fmt.Println("Connection closed")
+	// fmt.Println("Connection closed")
 }
